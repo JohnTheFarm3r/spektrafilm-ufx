@@ -1,0 +1,48 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform image2D image;
+
+SPEKTRA_BUFFER(1, uint, 4u, words)
+
+layout(push_constant) uniform ImageFormatConvertParams {
+  uint pixelCount;
+  uint mode;
+  uint width;
+  uint originX;
+  uint originY;
+  uint bufferWidth;
+  uint bufferOriginX;
+  uint bufferOriginY;
+} params;
+
+void main() {
+  const uint pixelIndex = gl_GlobalInvocationID.x +
+    gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+  if (pixelIndex >= params.pixelCount) {
+    return;
+  }
+
+  const ivec2 coord = ivec2(
+    int(pixelIndex % params.width + params.originX),
+    int(pixelIndex / params.width + params.originY)
+  );
+  const uint bufferIndex =
+    (pixelIndex / params.width + params.bufferOriginY) * params.bufferWidth +
+    pixelIndex % params.width + params.bufferOriginX;
+  const uint wordOffset = bufferIndex * 4u;
+  if (params.mode == 0u) {
+    const vec4 color = imageLoad(image, coord);
+    write_words(wordOffset, floatBitsToUint(color.r));
+    write_words(wordOffset + 1u, floatBitsToUint(color.g));
+    write_words(wordOffset + 2u, floatBitsToUint(color.b));
+    write_words(wordOffset + 3u, floatBitsToUint(color.a));
+  } else {
+    const vec2 rg = unpackHalf2x16(read_words(bufferIndex * 2u));
+    const vec2 ba = unpackHalf2x16(read_words(bufferIndex * 2u + 1u));
+    imageStore(image, coord, vec4(rg, ba));
+  }
+}

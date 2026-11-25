@@ -1,0 +1,30 @@
+Film Simulation UFX plug-in for Android
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE.
+
+Film engine
+  plugin/src/main/cpp/spektrafilm/src, shaders and tools
+  From spektrafilm OFX, Copyright (C) 2026 Aedan Diez
+  https://github.com/chaert-s/spektrafilm-ofx
+  Licensed under the GNU General Public License version 3.
+
+  Modified for Android, 2026: shaders and spectral data are embedded in the
+  library, the renderer runs on a host-provided Vulkan device and queue
+  (queue access goes through host lock callbacks), video export paths with
+  colour tables were added, GPUs that cannot filter 32-bit float textures
+  blend the colour tables in the shader instead, and host-specific error
+  messages were made generic.
+
+Film profiles and spectral data
+  plugin/src/main/cpp/spektrafilm/Resources/data
+  spektrafilm by Andrea Volpato
+  https://github.com/andreavolpato/spektrafilm
+  Profiles are licensed CC BY-SA 4.0. See SPEKTRAFILM_LICENSE.txt.
+  The profile files are included unmodified.
+
+Plug-in interface
+  plugin/src/main/cpp/ufx/include/ufx/ufx_plugin.h
+  Licensed under the MIT License, as stated in the file.

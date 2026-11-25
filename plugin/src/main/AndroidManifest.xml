@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:label="Film Simulation">
+
+        <service
+            android:name="spektrafilm.ufx.UfxPluginService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="ufx.PLUGIN" />
+            </intent-filter>
+            <meta-data
+                android:name="ufx.ENTRY_CLASS"
+                android:value="spektrafilm.ufx.UfxEntry" />
+        </service>
+    </application>
+
+</manifest>

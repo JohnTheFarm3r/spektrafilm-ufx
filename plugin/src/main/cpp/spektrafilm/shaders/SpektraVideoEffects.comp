@@ -1,0 +1,178 @@
+#version 450
+#include "SpektraStorageBuffer.glsl"
+
+// Spatial film effects for video. A shared blur pyramid of film exposure approximates
+// camera diffusion and halation, and a second pyramid of print exposure carries print diffusion.
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(constant_id = 32) const uint kOperation = 0u;
+
+const uint kOpFilmBase = 0u;
+const uint kOpFilmDown = 1u;
+const uint kOpFilmChain = 2u;
+const uint kOpFilmCompose = 3u;
+const uint kOpPrintBase = 4u;
+const uint kOpPrintDown = 5u;
+const uint kOpPrintChain = 6u;
+const uint kOpPrintCompose = 7u;
+
+const uint kFlagFilm = 1u;
+const uint kFlagBoost = 2u;
+const uint kFlagPrint = 4u;
+
+const float kLog10E = 0.4342944819032518;
+const float kHalfMax = 65504.0;
+
+// Film raw exposure or print raw exposure, depending on the operation.
+SPEKTRA_READ_BUFFER(0, vec4, 16u, inputPixels)
+// Film log exposure for development, or diffused print raw exposure.
+SPEKTRA_WRITE_BUFFER(1, vec4, 16u, outputPixels)
+
+// Frame maximum, threshold, shape and gain of the halation boost.
+layout(std430, binding = 10) readonly buffer BoostInfo {
+  vec4 boostInfo;
+};
+
+layout(std430, binding = 11) readonly buffer VideoInfo {
+  uvec4 config;      // film levels, flags, print levels
+  vec4 sharp;        // unblurred film weight, w = film pyramid scale
+  vec4 sharpPrint;   // unblurred print weight, w = print pyramid scale
+  vec4 boost;        // boost EV, range, protect EV
+  vec4 weights[10];
+  vec4 printWeights[10];
+} info;
+
+layout(binding = 12) uniform sampler2D filmPyramid;
+layout(binding = 13) uniform sampler2D printPyramid;
+layout(set = 1, binding = 0, rgba16f) uniform image2D filmLevel;
+layout(set = 1, binding = 1, rgba16f) uniform image2D printLevel;
+
+layout(push_constant) uniform VideoParams {
+  uint width;
+  uint height;
+  uint level;
+  uint reserved;
+} params;
+
+float max3(vec3 value) {
+  return max(max(value.r, value.g), value.b);
+}
+
+// Matches the photo halation boost, using the maximum of the current frame.
+float boostChannel(float value, float rawX0, float maxRaw, float a, float k) {
+  if (value <= rawX0) {
+    return value;
+  }
+  const float dx = (value - rawX0) / max(maxRaw, 1.0e-10);
+  return value + k * maxRaw * (exp(a * dx) - a * dx - 1.0);
+}
+
+vec3 applyBoost(vec3 raw) {
+  if ((info.config.y & kFlagBoost) == 0u) {
+    return raw;
+  }
+  const float frameMax = boostInfo.x;
+  const float rawX0 = boostInfo.y;
+  const float a = boostInfo.z;
+  const float k = boostInfo.w;
+  if (frameMax <= 0.0 || k <= 0.0 || rawX0 >= frameMax || max3(raw) <= rawX0) {
+    return raw;
+  }
+  return vec3(
+    boostChannel(raw.r, rawX0, frameMax, a, k),
+    boostChannel(raw.g, rawX0, frameMax, a, k),
+    boostChannel(raw.b, rawX0, frameMax, a, k));
+}
+
+vec3 loadInput(ivec2 position) {
+  const ivec2 limit = ivec2(params.width, params.height) - 1;
+  const ivec2 clamped = clamp(position, ivec2(0), limit);
+  return read_inputPixels(uint(clamped.y) * params.width + uint(clamped.x)).rgb;
+}
+
+// Each base texel averages the 2x2 block of full-resolution pixels it covers.
+vec3 baseAverage(ivec2 gid, bool boost) {
+  vec3 sum = vec3(0.0);
+  for (int y = 0; y < 2; ++y) {
+    for (int x = 0; x < 2; ++x) {
+      const vec3 value = loadInput(gid * 2 + ivec2(x, y));
+      sum += boost ? applyBoost(value) : value;
+    }
+  }
+  return sum * 0.25;
+}
+
+vec4 downsample(sampler2D pyramid, ivec2 position, ivec2 size, int level) {
+  const vec2 uv = (vec2(position) + 0.5) / vec2(size);
+  const vec2 offset = 0.75 / vec2(textureSize(pyramid, level - 1));
+  const float lod = float(level - 1);
+  return 0.25 * (textureLod(pyramid, uv - offset, lod) + textureLod(pyramid, uv + offset, lod) +
+    textureLod(pyramid, uv + vec2(offset.x, -offset.y), lod) + textureLod(pyramid, uv + vec2(-offset.x, offset.y), lod));
+}
+
+vec3 upsample(sampler2D pyramid, vec2 uv, int level) {
+  const vec2 offset = 0.5 / vec2(textureSize(pyramid, level));
+  const float lod = float(level);
+  return 0.25 * (textureLod(pyramid, uv - offset, lod).rgb + textureLod(pyramid, uv + offset, lod).rgb +
+    textureLod(pyramid, uv + vec2(offset.x, -offset.y), lod).rgb +
+    textureLod(pyramid, uv + vec2(-offset.x, offset.y), lod).rgb);
+}
+
+void chainLevel(ivec2 position, bool print) {
+  const ivec2 size = print ? imageSize(printLevel) : imageSize(filmLevel);
+  if (any(greaterThanEqual(position, size))) return;
+  const int level = int(params.level);
+  const vec3 own = print ? imageLoad(printLevel, position).rgb : imageLoad(filmLevel, position).rgb;
+  vec3 glow = (print ? info.printWeights[level].rgb : info.weights[level].rgb) * own;
+  const int count = int(print ? info.config.z : info.config.x);
+  if (level + 1 < count) {
+    const vec2 uv = (vec2(position) + 0.5) / vec2(size);
+    glow += print ? upsample(printPyramid, uv, level + 1) : upsample(filmPyramid, uv, level + 1);
+  }
+  if (print) imageStore(printLevel, position, vec4(glow, 1.0));
+  else imageStore(filmLevel, position, vec4(glow, 1.0));
+}
+
+void main() {
+  const ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+  if (kOperation == kOpFilmBase || kOperation == kOpPrintBase) {
+    const bool print = kOperation == kOpPrintBase;
+    const ivec2 size = print ? imageSize(printLevel) : imageSize(filmLevel);
+    if (any(greaterThanEqual(gid, size))) return;
+    const vec3 value = baseAverage(gid, !print) * (print ? info.sharpPrint.w : info.sharp.w);
+    const vec4 stored = vec4(clamp(value, vec3(-kHalfMax), vec3(kHalfMax)), 1.0);
+    if (print) imageStore(printLevel, gid, stored);
+    else imageStore(filmLevel, gid, stored);
+  } else if (kOperation == kOpFilmDown) {
+    const ivec2 size = imageSize(filmLevel);
+    if (all(lessThan(gid, size))) {
+      imageStore(filmLevel, gid, downsample(filmPyramid, gid, size, int(params.level)));
+    }
+  } else if (kOperation == kOpPrintDown) {
+    const ivec2 size = imageSize(printLevel);
+    if (all(lessThan(gid, size))) {
+      imageStore(printLevel, gid, downsample(printPyramid, gid, size, int(params.level)));
+    }
+  } else if (kOperation == kOpFilmChain || kOperation == kOpPrintChain) {
+    chainLevel(gid, kOperation == kOpPrintChain);
+  } else {
+    if (gid.x >= int(params.width) || gid.y >= int(params.height)) return;
+    const uint index = uint(gid.y) * params.width + uint(gid.x);
+    const vec4 source = read_inputPixels(index);
+    const vec2 uv = (vec2(gid) + 0.5) / vec2(params.width, params.height);
+    if (kOperation == kOpFilmCompose) {
+      vec3 film = applyBoost(source.rgb);
+      if ((info.config.y & kFlagFilm) != 0u) {
+        film = info.sharp.rgb * film + upsample(filmPyramid, uv, 0) / info.sharp.w;
+      }
+      write_outputPixels(index, vec4(log(max(film, vec3(0.0)) + vec3(1.0e-10)) * kLog10E, source.a));
+    } else {
+      vec3 print = source.rgb;
+      if ((info.config.y & kFlagPrint) != 0u) {
+        print = info.sharpPrint.rgb * print + upsample(printPyramid, uv, 0) / info.sharpPrint.w;
+      }
+      write_outputPixels(index, vec4(print, source.a));
+    }
+  }
+}

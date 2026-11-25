@@ -1,0 +1,280 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+#include "SpektraFrameLayout.h"
+#define SPEKTRA_GRAIN_BLUR
+#include "SpektraGrainCommon.glsl"
+
+layout(constant_id = 32) const uint specializedOperation = 0xffffffffu;
+const uint kOpFrameConstants = 14u;
+
+GaussianBlurInfo loadGaussianBlurInfo(uint component) {
+  const uint base = SPEKTRA_GRAIN_BLUR_BASE + component * SPEKTRA_GRAIN_BLUR_STRIDE;
+  GaussianBlurInfo info;
+  info.firstWeight = f(base + 1u);
+  info.firstRatio = f(base + 2u);
+  info.ratioStep = f(base + 3u);
+  info.invWeightSum = f(base + 4u);
+  info.radius = uint(f(base + 5u));
+  info.enabled = uint(f(base + 6u));
+  return info;
+}
+
+void buildBlurConstants(uint component) {
+  const float sigma = component < 9u ? grainLayerBlurSigma(component / 3u, component % 3u)
+    : (component == 9u ? max(f(kFrameGrainMicroStructureScale), 0.0) / max(f(kFrameFilmPixelSizeUm), 1.0e-6)
+                       : max(f(kFrameGrainFinalBlurSigmaPx), 0.0));
+  const GaussianBlurInfo info = makeGaussianBlurInfo(sigma, 64);
+  const uint base = SPEKTRA_GRAIN_BLUR_BASE + component * SPEKTRA_GRAIN_BLUR_STRIDE;
+  frameFloats[base] = sigma;
+  frameFloats[base + 1u] = info.firstWeight;
+  frameFloats[base + 2u] = info.firstRatio;
+  frameFloats[base + 3u] = info.ratioStep;
+  frameFloats[base + 4u] = info.invWeightSum;
+  frameFloats[base + 5u] = float(info.radius);
+  frameFloats[base + 6u] = float(info.enabled);
+}
+
+float cachedLayerBlurX(uvec3 gid, bool sourceIsA) {
+  const uint component = gid.z;
+  const uint layer = component / 3u;
+  const uint channel = component - layer * 3u;
+  if (u(kFrameIntGrainSynthesisActive) != 0u && u(kFrameIntGrainSynthesisLayered) == 0u && layer > 0u) {
+    return 0.0;
+  }
+  const float sigma = f(SPEKTRA_GRAIN_BLUR_BASE + component * SPEKTRA_GRAIN_BLUR_STRIDE);
+  if (sigma <= 1.0e-4) {
+    return sourceIsA
+      ? sampleLayerA(int(gid.x), int(gid.y), component)
+      : sampleLayerB(int(gid.x), int(gid.y), component);
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = loadGaussianBlurInfo(component);
+    if (info.enabled == 0u || info.radius == 0u) {
+      return sourceIsA
+        ? sampleLayerA(int(gid.x), int(gid.y), component)
+        : sampleLayerB(int(gid.x), int(gid.y), component);
+    }
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    const int radius = int(info.radius);
+    float value = sourceIsA ? sampleLayerA(x, y, component) : sampleLayerB(x, y, component);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= radius; ++offset) {
+      const float samplePair = sourceIsA
+        ? sampleLayerA(x - offset, y, component) + sampleLayerA(x + offset, y, component)
+        : sampleLayerB(x - offset, y, component) + sampleLayerB(x + offset, y, component);
+      value += weight * samplePair;
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  float value = 0.0;
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * (sourceIsA
+      ? sampleLayerA(int(gid.x) + offset, int(gid.y), component)
+      : sampleLayerB(int(gid.x) + offset, int(gid.y), component));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+float cachedLayerBlurY(uvec3 gid, bool sourceIsA) {
+  const uint component = gid.z;
+  const uint layer = component / 3u;
+  const uint channel = component - layer * 3u;
+  if (u(kFrameIntGrainSynthesisActive) != 0u && u(kFrameIntGrainSynthesisLayered) == 0u && layer > 0u) {
+    return 0.0;
+  }
+  const float sigma = f(SPEKTRA_GRAIN_BLUR_BASE + component * SPEKTRA_GRAIN_BLUR_STRIDE);
+  if (sigma <= 1.0e-4) {
+    return sourceIsA
+      ? sampleLayerA(int(gid.x), int(gid.y), component)
+      : sampleLayerB(int(gid.x), int(gid.y), component);
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = loadGaussianBlurInfo(component);
+    if (info.enabled == 0u || info.radius == 0u) {
+      return sourceIsA
+        ? sampleLayerA(int(gid.x), int(gid.y), component)
+        : sampleLayerB(int(gid.x), int(gid.y), component);
+    }
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    const int radius = int(info.radius);
+    float value = sourceIsA ? sampleLayerA(x, y, component) : sampleLayerB(x, y, component);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= radius; ++offset) {
+      const float samplePair = sourceIsA
+        ? sampleLayerA(x, y - offset, component) + sampleLayerA(x, y + offset, component)
+        : sampleLayerB(x, y - offset, component) + sampleLayerB(x, y + offset, component);
+      value += weight * samplePair;
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  float value = 0.0;
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * (sourceIsA
+      ? sampleLayerA(int(gid.x), int(gid.y) + offset, component)
+      : sampleLayerB(int(gid.x), int(gid.y) + offset, component));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 cachedBlurMicroX(uvec2 gid) {
+  const float sigma = f(SPEKTRA_GRAIN_BLUR_BASE + 9u * SPEKTRA_GRAIN_BLUR_STRIDE);
+  if (u(kFrameIntGrainSublayersEnabled) == 0u || sigma <= 0.4) {
+    return sampleMicroA(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = loadGaussianBlurInfo(9u);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleMicroA(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleMicroA(x - offset, y) + sampleMicroA(x + offset, y));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleMicroA(int(gid.x) + offset, int(gid.y));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 cachedBlurMicroY(uvec2 gid) {
+  const float sigma = f(SPEKTRA_GRAIN_BLUR_BASE + 9u * SPEKTRA_GRAIN_BLUR_STRIDE);
+  if (u(kFrameIntGrainSublayersEnabled) == 0u || sigma <= 0.4) {
+    return sampleMicroB(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = loadGaussianBlurInfo(9u);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleMicroB(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleMicroB(x, y - offset) + sampleMicroB(x, y + offset));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleMicroB(int(gid.x), int(gid.y) + offset);
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 cachedDensityBlurX(uvec2 gid) {
+  const float sigma = f(SPEKTRA_GRAIN_BLUR_BASE + 10u * SPEKTRA_GRAIN_BLUR_STRIDE);
+  if (sigma <= 0.0 || (u(kFrameIntGrainSublayersEnabled) == 0u && sigma <= 0.4)) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = loadGaussianBlurInfo(10u);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleSource(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleSource(x - offset, y) + sampleSource(x + offset, y));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleSource(int(gid.x) + offset, int(gid.y));
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+vec4 cachedDensityBlurY(uvec2 gid) {
+  const float sigma = f(SPEKTRA_GRAIN_BLUR_BASE + 10u * SPEKTRA_GRAIN_BLUR_STRIDE);
+  if (sigma <= 0.0 || (u(kFrameIntGrainSublayersEnabled) == 0u && sigma <= 0.4)) {
+    return sampleSource(int(gid.x), int(gid.y));
+  }
+  if (u(kFrameIntGrainBlurRecurrence) != 0u) {
+    const GaussianBlurInfo info = loadGaussianBlurInfo(10u);
+    const int x = int(gid.x);
+    const int y = int(gid.y);
+    vec4 value = sampleSource(x, y);
+    float weight = info.firstWeight;
+    float ratio = info.firstRatio;
+    for (int offset = 1; offset <= int(info.radius); ++offset) {
+      value += weight * (sampleSource(x, y - offset) + sampleSource(x, y + offset));
+      weight *= ratio;
+      ratio *= info.ratioStep;
+    }
+    return value * info.invWeightSum;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 64);
+  vec4 value = vec4(0.0);
+  float weightSum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const float weight = gaussianWeight(float(offset), sigma);
+    value += weight * sampleSource(int(gid.x), int(gid.y) + offset);
+    weightSum += weight;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+void main() {
+  const uint operation = specializedOperation == 0xffffffffu ? params.operation : specializedOperation;
+  const uvec3 activeGid = gl_GlobalInvocationID.xyz;
+  if (operation == kOpFrameConstants) {
+    if (activeGid.x < 11u && activeGid.y == 0u && activeGid.z == 0u) buildBlurConstants(activeGid.x);
+    return;
+  }
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) return;
+  const uvec3 gid = uvec3(activeGid.xy + uvec2(params.activeOriginX, params.activeOriginY), activeGid.z);
+  if (gid.x >= params.width || gid.y >= params.height) return;
+  const uint index = gid.y * params.width + gid.x;
+  if (operation == kOpLayerBlurX && gid.z < 9u) {
+    write_grainLayerB(index * 9u + gid.z, cachedLayerBlurX(gid, true));
+  } else if (operation == kOpLayerBlurY && gid.z < 9u) {
+    write_grainLayerA(index * 9u + gid.z, cachedLayerBlurY(gid, false));
+  } else if (operation == kOpMicroBlurX) {
+    storeMicroBPixel(index, cachedBlurMicroX(gid.xy));
+  } else if (operation == kOpMicroBlurY) {
+    storeMicroAPixel(index, cachedBlurMicroY(gid.xy));
+  } else if (operation == kOpDensityBlurX || operation == kOpDensityBlurY) {
+    storeDestinationPixel(index, operation == kOpDensityBlurX ? cachedDensityBlurX(gid.xy) : cachedDensityBlurY(gid.xy));
+  }
+}

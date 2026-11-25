@@ -1,0 +1,269 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+#include "SpektraGrainCommon.glsl"
+
+shared uint synthesisCoverage[256];
+shared vec2 synthesisPoints[256];
+shared ivec4 synthesisCells[16];
+shared uint synthesisReuseCells[16];
+
+void main() {
+  if (params.operation == kOpSynthesisLayers) {
+    const uint lane = gl_LocalInvocationID.x % 16u;
+    const uint firstLane = gl_LocalInvocationIndex - lane;
+    const uint pixelSlot = firstLane / 16u;
+    const uvec3 samplePixel = uvec3(gl_WorkGroupID.x * 2u + gl_LocalInvocationID.x / 16u,
+                                   gl_GlobalInvocationID.yz);
+    const uvec3 gid = uvec3(samplePixel.xy + uvec2(params.activeOriginX, params.activeOriginY), samplePixel.z);
+    const bool valid = samplePixel.x < params.activeWidth && samplePixel.y < params.activeHeight &&
+                       gid.x < params.width && gid.y < params.height && gid.z < 9u;
+    const uint layer = gid.z / 3u;
+    const uint channel = gid.z % 3u;
+    const bool fixedRadius = f(kFrameGrainSynthesisRadiusStdDevRatio) <= 1.0e-6;
+    GrainSynthesisEval eval = makeGrainSynthesisEval(layer, channel, fixedRadius);
+    uint sampleCount = 0u;
+    vec2 pointUm = vec2(0.0);
+    const uint baseSeed = u(kFrameIntGrainSeed) ^ u(kFrameIntGrainFrameSeed);
+    const bool sampleActive = valid && grainSynthesisSamplePoint(
+      gid, baseSeed, params._pad1 + lane, sampleCount, pointUm);
+    const uint batchCount = sampleCount > params._pad1 ? min(16u, sampleCount - params._pad1) : 0u;
+    synthesisPoints[gl_LocalInvocationIndex] = pointUm;
+    barrier();
+
+    if (lane == 0u) {
+      ivec2 cellMin = ivec2(2147483647);
+      ivec2 cellMax = ivec2(-2147483647);
+      float separateCells = 0.0;
+      for (uint laneIndex = 0u; laneIndex < batchCount; ++laneIndex) {
+        const vec2 point = synthesisPoints[firstLane + laneIndex];
+        const ivec2 lo = ivec2(floor((point - eval.maxRadius) / eval.cellSize));
+        const ivec2 hi = ivec2(floor((point + eval.maxRadius) / eval.cellSize));
+        cellMin = min(cellMin, lo);
+        cellMax = max(cellMax, hi);
+        const vec2 extent = vec2(hi - lo + 1);
+        separateCells += extent.x * extent.y;
+      }
+      synthesisCells[pixelSlot] = ivec4(cellMin, cellMax);
+      const vec2 extent = batchCount > 0u ? vec2(cellMax - cellMin + 1) : vec2(0.0);
+      // Both paths evaluate the same cells. Share generation when it visits fewer cells.
+      synthesisReuseCells[pixelSlot] = batchCount > 0u && extent.x * extent.y < separateCells ? 1u : 0u;
+    }
+    barrier();
+
+    uint hits = 0u;
+    if (synthesisReuseCells[pixelSlot] != 0u) {
+      const ivec4 cells = synthesisCells[pixelSlot];
+      for (int cy = cells.y; cy <= cells.w; ++cy) {
+        for (int cx = cells.x + int(lane); cx <= cells.z; cx += 16) {
+          const ivec2 cell = ivec2(cx, cy);
+          const vec2 cellOrigin = vec2(float(cx), float(cy)) * eval.cellSize;
+          const float density = grainSynthesisDensityAtUm(cellOrigin + vec2(0.5 * eval.cellSize), layer, channel);
+          const float expectedGrains = max(density, 0.0) * eval.densityToLambda * eval.cellArea;
+          if (expectedGrains <= 1.0e-7) continue;
+          const uint cellSeed = grainSynthesisCellSeed(cell, channel, layer);
+          const uint grainCount = poissonSample(expectedGrains, cellSeed, eval.grainCap);
+          if (grainCount == 0u) continue;
+          uint eligible = 0u;
+          for (uint laneIndex = 0u; laneIndex < batchCount; ++laneIndex) {
+            if ((hits & (1u << laneIndex)) != 0u) continue;
+            const vec2 point = synthesisPoints[firstLane + laneIndex];
+            const ivec2 lo = ivec2(floor((point - eval.maxRadius) / eval.cellSize));
+            const ivec2 hi = ivec2(floor((point + eval.maxRadius) / eval.cellSize));
+            if (all(greaterThanEqual(cell, lo)) && all(lessThanEqual(cell, hi)) &&
+                grainSynthesisCellDistanceSquared(point, cellOrigin, eval.cellSize) <= eval.maxRadiusSquared) {
+              eligible |= 1u << laneIndex;
+            }
+          }
+          for (uint grain = 0u; grain < grainCount && eligible != 0u; ++grain) {
+            const uint grainSeed = mixSeed(cellSeed, grain * 0x9e3779b9u);
+            const vec2 center = cellOrigin + vec2(rand01(grainSeed ^ 0x68bc21ebu),
+                                                 rand01(grainSeed ^ 0x02e5be93u)) * eval.cellSize;
+            const float radius = fixedRadius ? eval.scaledMeanRadius
+              : grainSynthesisRadius(eval.scaledMeanRadius, eval.maxRadius, grainSeed ^ 0x85ebca6bu);
+            for (uint laneIndex = 0u; laneIndex < batchCount; ++laneIndex) {
+              const uint bit = 1u << laneIndex;
+              if ((eligible & bit) == 0u) continue;
+              const vec2 delta = synthesisPoints[firstLane + laneIndex] - center;
+              if (dot(delta, delta) <= radius * radius) {
+                hits |= bit;
+                eligible &= ~bit;
+              }
+            }
+          }
+        }
+      }
+    } else if (sampleActive && grainSynthesisIndicator(pointUm, layer, channel, eval, fixedRadius)) {
+      hits = 1u << lane;
+    }
+    synthesisCoverage[gl_LocalInvocationIndex] = hits;
+    barrier();
+    if (lane == 0u && valid) {
+      const uint index = (gid.y * params.width + gid.x) * 9u + gid.z;
+      if (sampleCount == 0u) {
+        write_grainLayerA(index, 0.0);
+      } else if (params._pad1 < sampleCount) {
+        uint covered = 0u;
+        for (uint laneIndex = 0u; laneIndex < 16u; ++laneIndex) {
+          covered |= synthesisCoverage[firstLane + laneIndex];
+        }
+        const float accumulated = float(bitCount(covered)) + (params._pad1 == 0u ? 0.0 : read_grainLayerA(index));
+        if (params._pad1 + 16u < sampleCount) {
+          write_grainLayerA(index, accumulated);
+        } else {
+          const float epsilon = max(f(kFrameGrainSynthesisCoverageEpsilon), 1.0e-8);
+          const float coverage = clamp(accumulated / max(float(sampleCount), 1.0), 0.0, 1.0 - epsilon);
+          write_grainLayerA(index, -log(max(1.0 - coverage, epsilon)) / 2.302585093);
+        }
+      }
+    }
+    return;
+  }
+  const uvec3 activeGid3 = gl_GlobalInvocationID.xyz;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid3.x >= activeWidth || activeGid3.y >= activeHeight) {
+    return;
+  }
+  const uvec3 gid3 = uvec3(activeGid3.xy + uvec2(params.activeOriginX, params.activeOriginY), activeGid3.z);
+  if (gid3.x >= params.width || gid3.y >= params.height) {
+    return;
+  }
+  const uint index = gid3.y * params.width + gid3.x;
+
+  const uint baseSeed = u(kFrameIntGrainSeed) ^ u(kFrameIntGrainFrameSeed);
+  if (params.operation == kOpSynthesisSourceLayers) {
+    if (gid3.z >= 9u) return;
+    const uint layer = gid3.z / 3u;
+    const uint channel = gid3.z % 3u;
+    const float density = channelComponent(loadSourcePixel(index).rgb, channel);
+    const float layerDensity = u(kFrameIntGrainSynthesisLayered) == 0u
+      ? (layer == 0u ? max(density, 0.0) : 0.0)
+      : interpDensityLayer(density, channel, layer);
+    write_grainLayerB(index * 9u + gid3.z, layerDensity);
+    return;
+  }
+  if (params.operation == kOpPreview) {
+    const vec4 source = loadSourcePixel(index);
+    const vec3 grained = previewGrainDensity(source.rgb, outputPixelFilmUm(gid3.xy), baseSeed);
+    storeDestinationPixel(index, vec4(applyGrainControls(source.rgb, grained), source.a));
+    return;
+  }
+
+  if (params.operation == kOpProductionLayers) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    const uint component = gid3.z;
+    const uint layer = component / 3u;
+    const uint channel = component - layer * 3u;
+    write_grainLayerA(index * 9u + component, productionLayerParticleDensity(
+      loadSourcePixel(index).rgb,
+      layer,
+      channel,
+      outputPixelFilmUm(gid3.xy),
+      baseSeed
+    ));
+    return;
+  }
+
+  if (params.operation == kOpLayerBlurX) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    write_grainLayerB(index * 9u + gid3.z, layerBlurX(gid3, true));
+    return;
+  }
+
+  if (params.operation == kOpLayerBlurY) {
+    if (gid3.z >= 9u) {
+      return;
+    }
+    write_grainLayerA(index * 9u + gid3.z, layerBlurY(gid3, false));
+    return;
+  }
+
+  if (params.operation == kOpMicroSource) {
+    const float sigma = max(f(kFrameGrainMicroStructureSigmaPx), 0.0);
+    if (u(kFrameIntGrainSublayersEnabled) == 0u || sigma <= 0.05 || f(kFrameGrainMicroStructureScale) <= 0.0) {
+      storeMicroAPixel(index, vec4(1.0));
+      return;
+    }
+    const vec2 filmUm = outputPixelFilmUm(gid3.xy);
+    const uint seed = filmCellSeed(
+      filmUm,
+      max(f(kFrameGrainMicroStructureScale), 1.0e-4),
+      baseSeed ^ 0x23d3c1f1u ^ 0xa349b329u
+    );
+    const float logSigma = sqrt(log(1.0 + sigma * sigma));
+    const float logMean = -0.5 * logSigma * logSigma;
+    storeMicroAPixel(index, vec4(
+      exp(logMean + logSigma * gaussian(seed ^ 0x165667b1u)),
+      exp(logMean + logSigma * gaussian(seed ^ 0x27d4eb2du)),
+      exp(logMean + logSigma * gaussian(seed ^ 0x85ebca6bu)),
+      1.0
+    ));
+    return;
+  }
+
+  if (params.operation == kOpMicroBlurX) {
+    storeMicroBPixel(index, blurMicroX(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpMicroBlurY) {
+    storeMicroAPixel(index, blurMicroY(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpResolveDensity) {
+    const vec4 source = loadSourcePixel(index);
+    if (u(kFrameIntGrainSublayersEnabled) == 0u) {
+      storeDestinationPixel(index, vec4(
+        max(read_grainLayerA(index * 9u), 0.0),
+        max(read_grainLayerA(index * 9u + 1u), 0.0),
+        max(read_grainLayerA(index * 9u + 2u), 0.0),
+        source.a
+      ));
+      return;
+    }
+    const vec3 densityMin = vec3(channelDensityMin(0u), channelDensityMin(1u), channelDensityMin(2u));
+    vec3 density = vec3(0.0);
+    for (uint layer = 0u; layer < 3u; ++layer) {
+      density.r += read_grainLayerA(index * 9u + layer * 3u);
+      density.g += read_grainLayerA(index * 9u + layer * 3u + 1u);
+      density.b += read_grainLayerA(index * 9u + layer * 3u + 2u);
+    }
+    density *= loadMicroAPixel(index).rgb;
+    storeDestinationPixel(index, vec4(max(density - densityMin, vec3(0.0)), source.a));
+    return;
+  }
+
+  if (params.operation == kOpSynthesisResolveDensity) {
+    const vec4 source = loadSourcePixel(index);
+    storeDestinationPixel(index, vec4(resolveGrainSynthesisDensity(index), source.a));
+    return;
+  }
+
+  if (params.operation == kOpDensityBlurX) {
+    storeDestinationPixel(index, densityBlurX(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpDensityBlurY) {
+    storeDestinationPixel(index, densityBlurY(gid3.xy));
+    return;
+  }
+
+  if (params.operation == kOpApplyControls) {
+    const vec4 base = loadSourcePixel(index);
+    const vec4 grained = loadDestinationPixel(index);
+    storeAuxAPixel(index, vec4(applyGrainControls(base.rgb, grained.rgb), grained.a));
+    return;
+  }
+
+  if (params.operation == kOpCopyDensity) {
+    storeAuxAPixel(index, loadDestinationPixel(index));
+  }
+}

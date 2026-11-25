@@ -1,0 +1,10 @@
+.gradle/
+.idea/
+.cxx/
+.externalNativeBuild/
+build/
+captures/
+local.properties
+*.iml
+__pycache__/
+keystore.properties
